@@ -1,0 +1,44 @@
+#!/usr/bin/env bpftrace
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/*
+ * wakesnoop.bt   Scheduler latency tracing tool.
+ *
+ * USAGE:
+ * ./wakesnoop.bt [wakeup delay threshold, us] [cpu mask] [pid]
+ *
+ * Copyright 2024 Red Hat, Inc., Costa Shulyupin
+ *
+ */
+
+BEGIN
+{
+	printf("Tracing scheduler delay and in microseconds. Ctrl-C to end.\n");
+	printf("%-15s %9s %3s %7s %s\n", "TIME", "DELAY(us)", "CPU", "PID", "COMM");
+}
+
+
+tracepoint:sched:sched_waking,
+/!$3 || args.pid == $3/
+{
+	@waking[args.pid] = nsecs;
+}
+
+tracepoint:sched:sched_wakeup
+/(!$3 || args.pid == $3) && @waking[args.pid] /
+{
+	$delay = (nsecs - @waking[args.pid]) / 1000;
+	@sched_wakeup_delay_max = max($delay);
+	if ($delay > $1 && (!$2 || 1 << args.target_cpu & $2)) {
+		printf("%s %9u %3u %7d %s\n",
+			strftime("%H:%M:%S.%f", @waking[args.pid]), $delay, args.target_cpu,
+			args.pid, args.comm);
+	}
+	delete(@waking[args.pid]);
+}
+
+END
+{
+	clear(@waking);
+}

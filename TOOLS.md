@@ -15,3 +15,4 @@ Show entries about TCP&UDP in nf_conntrack.
 Trace scheduling of system processes between NUMA nodes.
 - [sigsnoop](https://github.com/bpftrace/user-tools/tree/master/sigsnoop):
 Trace standard and real-time signals.
+- [wakesnoop](wakesnoop): Task wakeup latency tracing.
