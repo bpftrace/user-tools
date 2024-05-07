@@ -1,0 +1,7 @@
+Show entries about TCP&UDP in nf_conntrack. For Linux, uses bpftrace, eBPF. For example:
+
+# nfcttrace.bt
+Attaching 3 probes...
+Show nf_conntrack TCP&UDP entries... Hit Ctrl-C to end.
+[nf_ct] proto=tcp status=unreplied osaddr=10.203.55.12 odaddr=10.203.55.11 osport=64123 odport=10259 rsaddr=10.203.55.11 rdaddr=10.203.55.12 rsport=10259 rdport=64123
+[nf_ct] proto=tcp status=replied osaddr=10.203.55.12 odaddr=10.203.55.11 osport=5937 odport=30678 rsaddr=172.31.2.129 rdaddr=10.203.55.11 rsport=9090 rdport=51602
