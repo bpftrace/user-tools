@@ -1,0 +1,85 @@
+#!/usr/bin/env bpftrace
+/*
+ * nfcttrace.bt     Show entries about TCP&UDP in nf_conntrack. For Linux, uses bpftrace, eBPF.
+ *
+ * 7-Jul-2023   Weiyang Wang	Created this.
+ */
+
+#include <net/netfilter/nf_conntrack.h>
+
+BEGIN
+{
+    printf("Show nf_conntrack TCP&UDP entries... Hit Ctrl-C to end.\n");
+    @prot2str[IPPROTO_TCP] = "tcp";
+    @prot2str[IPPROTO_UDP] = "udp";
+}
+
+kprobe:nf_ct_delete
+{
+    $ct = (struct nf_conn*)arg0;
+    $prefix = "[nf_ct]";
+    $suffix = "";
+
+    $original_tuple = $ct->tuplehash[0].tuple;
+    $protocol = $original_tuple.dst.protonum;
+
+    // original
+    if ($protocol == IPPROTO_TCP || $protocol == IPPROTO_UDP) {
+        // print portocol
+        printf("%s proto=%s", $prefix, @prot2str[$protocol]);
+        // status
+        printf(" status=%s", IPS_SEEN_REPLY & $ct->status ? "replied" : "unreplied");
+
+        // print ip/ipv6
+        if($original_tuple.src.l3num == AF_INET){
+            $original_saddr = ntop(AF_INET, $original_tuple.src.u3.ip);
+            $original_daddr = ntop(AF_INET, $original_tuple.dst.u3.ip);
+        } else {
+            $original_saddr = ntop(AF_INET6, $original_tuple.src.u3.all);
+            $original_daddr = ntop(AF_INET6, $original_tuple.dst.u3.all);
+        }
+        printf(" osaddr=%s odaddr=%s", $original_saddr, $original_daddr);
+
+        // print port
+        $original_sport = $original_tuple.src.u.all;
+        $original_sport = ($original_sport >> 8) | (($original_sport << 8) & 0xff00);
+        $original_dport = $original_tuple.dst.u.all;
+        $original_dport = ($original_dport >> 8) | (($original_dport << 8) & 0xff00);
+        printf(" osport=%d odport=%d", $original_sport, $original_dport);
+
+        $prefix = "";
+        $suffix = "\n";
+    }
+
+    $reply_tuple = $ct->tuplehash[1].tuple;
+    $protocol = $reply_tuple.dst.protonum;
+
+    // reply
+    if ($protocol == IPPROTO_TCP || $protocol == IPPROTO_UDP) {
+        // print ip/ipv6
+        if ($reply_tuple.src.l3num == AF_INET) {
+            $reply_saddr = ntop(AF_INET, $reply_tuple.src.u3.ip);
+            $reply_daddr = ntop(AF_INET, $reply_tuple.dst.u3.ip);
+        } else {
+            $reply_saddr = ntop(AF_INET6, $reply_tuple.src.u3.all);
+            $reply_daddr = ntop(AF_INET6, $reply_tuple.dst.u3.all);
+        }
+        printf(" rsaddr=%s rdaddr=%s", $reply_saddr, $reply_daddr);
+
+        // print port
+        $reply_sport = $reply_tuple.src.u.all;
+        $reply_sport = ($reply_sport >> 8) | (($reply_sport << 8) & 0xff00);
+        $reply_dport = $reply_tuple.dst.u.all;
+        $reply_dport = ($reply_dport >> 8) | (($reply_dport << 8) & 0xff00);
+        printf(" rsport=%d rdport=%d", $reply_sport, $reply_dport);
+
+        $suffix = "\n";
+    }
+
+    printf("%s", $suffix);
+}
+
+END
+{
+    clear(@prot2str);
+}
