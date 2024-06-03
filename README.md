@@ -15,6 +15,10 @@ One intention is that all new official tools begin life in this repository. And
 over time we'll develop some criteria for promoting a user tool to an official
 tool that bpftrace maintainers will help support over long periods of time.
 
+## Timer tools
+
+- [hrtimersnoop](./timer/hrtimersnoop.bt) – High-resolution timer latency tracing. [Example](./timer/hrtimersnoop_example.txt)
+
 
 [0]: https://github.com/bpftrace/bpftrace/blob/master/CONTRIBUTING-TOOLS.md
 
