@@ -8,6 +8,6 @@ comprehensive list is available
 
 - [numasched](https://github.com/bpftrace/user-tools/tree/master/numasched):
 Trace scheduling of system processes between NUMA nodes.
-- [sigsnoop](https://github.com/bpftrace/user-tools/tree/master/signal): 
+- [sigsnoop](https://github.com/bpftrace/user-tools/tree/master/sigsnoop):
 Trace standard and real-time signals.
 
