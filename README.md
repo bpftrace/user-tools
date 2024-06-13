@@ -19,6 +19,11 @@ tool that bpftrace maintainers will help support over long periods of time.
 
 ## [Tools List](TOOLS.md)
 
+## [How to Contribute a New Tool](CONTRIBUTING.md)
+
+If you want to contribute bpftrace tools to this repo, please follow 
+[these guidelines](CONTRIBUTING.md).
+
 ## Licensing
 
 Depending on which [BPF helpers](kernel-versions.md#helpers) are used by 
