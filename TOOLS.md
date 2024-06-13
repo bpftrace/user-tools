@@ -10,4 +10,5 @@ comprehensive list is available
 Trace scheduling of system processes between NUMA nodes.
 - [sigsnoop](https://github.com/bpftrace/user-tools/tree/master/signal): 
 Trace standard and real-time signals.
-
+- [nfcttrace](https://github.com/bpftrace/user-tools/tree/master/nfcttrace): 
+Show entries about TCP&UDP in nf_conntrack.

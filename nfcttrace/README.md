@@ -5,6 +5,7 @@ This is done by instrumenting kprobe:nf_ct_delete.
 
 ## Output
 
+```shell
 $ sudo ./nfcttrace.bt
 Attaching 3 probes...
 Show nf_conntrack TCP&UDP entries... Hit Ctrl-C to end.
@@ -15,3 +16,4 @@ Show nf_conntrack TCP&UDP entries... Hit Ctrl-C to end.
 [nf_ct] proto=udp status=replied osaddr=10.203.100.11 odaddr=10.206.130.1 osport=56589 odport=53 rsaddr=10.206.130.1 rdaddr=10.203.100.11 rsport=53 rdport=56589
 [nf_ct] proto=tcp status=replied osaddr=10.203.114.12 odaddr=10.203.100.11 osport=20590 odport=10256 rsaddr=10.203.100.11 rdaddr=10.203.114.12 rsport=10256 rdport=20590
 ^C
+```
