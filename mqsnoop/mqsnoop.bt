@@ -1,0 +1,33 @@
+#!/bin/env bpftrace
+// SPDX-License-Identifier: GPL-2.0-or-later
+/**
+ * mqsnoop.bt - Tracing and dump POSIX message queue send.
+ *              For Linux, uses bpftrace and eBPF.
+ *
+ * USAGE: mqsnoop.bt
+ *
+ * Copyright (C) 2024 CESTC, Co.
+ */
+BEGIN
+{
+	printf("Tracing POSIX message queue send, hit ctrl-c to end.\n");
+	printf("%-8s %-8s %-16s %-8s %-8s %-8s\n",
+		"TIME", "PID", "COMM", "LEN", "PRIO", "MSG");
+}
+
+/* No need to attach uprobe:libc:mq_send, mq_send() will call mq_timedsend() */
+uprobe:libc:mq_timedsend
+{
+	$msg = arg1;
+	$len = arg2;
+	$prio = arg3;
+
+	time("%H:%M:%S ");
+	printf("%-8d %-16s %-8d %-8d %r\n",
+		pid, comm, $len, $prio, buf($msg, $len));
+}
+
+END
+{
+	printf("Bye.\n");
+}

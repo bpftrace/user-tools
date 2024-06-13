@@ -6,6 +6,8 @@ process of migrating tools from the
 comprehensive list is available 
 [here](https://github.com/bpftrace/bpftrace/blob/master/README.md#tools).
 
+- [mqsnoop](https://github.com/bpftrace/user-tools/tree/master/mqsnoop):
+Trace POSIX message queue send.
 - [numasched](https://github.com/bpftrace/user-tools/tree/master/numasched):
 Trace scheduling of system processes between NUMA nodes.
 - [sigsnoop](https://github.com/bpftrace/user-tools/tree/master/signal): 
