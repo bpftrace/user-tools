@@ -85,5 +85,5 @@ kprobe:nf_ct_delete
 END
 {
     clear(@prot2str);
-	printf("Bye.\n");
+    printf("Bye.\n");
 }
