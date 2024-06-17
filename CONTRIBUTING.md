@@ -25,6 +25,8 @@ it's solving.
 1. **Add usage instructions as a comment at the top of the tool**. Think of 
 this as a man page. Add details about positional params and how they affect the 
 tool's behavior. These details can also go in the README.md.
+1. **Make sure your tool's license is correct**. An explicit license is not 
+required but if you want one, follow [this guide](README.md#licensing).
 1. **Spell check your documentation**. Use a spell checker like aspell to check 
 your document quality before committing.
 1. **Add an entry to TOOLS.md**. Make sure this list stays alphabetized.
