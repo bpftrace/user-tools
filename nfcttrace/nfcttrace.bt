@@ -45,9 +45,9 @@ kprobe:nf_ct_delete
 
         // print port
         $original_sport = $original_tuple.src.u.all;
-        $original_sport = ($original_sport >> 8) | (($original_sport << 8) & 0xff00);
+        $original_sport = bswap($original_sport);
         $original_dport = $original_tuple.dst.u.all;
-        $original_dport = ($original_dport >> 8) | (($original_dport << 8) & 0xff00);
+        $original_dport = bswap($original_dport);
         printf(" osport=%d odport=%d", $original_sport, $original_dport);
 
         $prefix = "";
@@ -71,9 +71,9 @@ kprobe:nf_ct_delete
 
         // print port
         $reply_sport = $reply_tuple.src.u.all;
-        $reply_sport = ($reply_sport >> 8) | (($reply_sport << 8) & 0xff00);
+        $reply_sport = bswap($reply_sport);
         $reply_dport = $reply_tuple.dst.u.all;
-        $reply_dport = ($reply_dport >> 8) | (($reply_dport << 8) & 0xff00);
+        $reply_dport = bswap($reply_dport);
         printf(" rsport=%d rdport=%d", $reply_sport, $reply_dport);
 
         $suffix = "\n";
