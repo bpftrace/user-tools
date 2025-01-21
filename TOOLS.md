@@ -6,6 +6,7 @@ process of migrating tools from the
 comprehensive list is available 
 [here](https://github.com/bpftrace/bpftrace/blob/master/README.md#tools).
 
+- [hrtimersnoop](hrtimersnoop): High-resolution timer latency tracing.
 - [mqsnoop](https://github.com/bpftrace/user-tools/tree/master/mqsnoop):
 Trace POSIX message queue send.
 - [nfcttrace](https://github.com/bpftrace/user-tools/tree/master/nfcttrace): 
