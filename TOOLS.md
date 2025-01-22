@@ -7,12 +7,8 @@ comprehensive list is available
 [here](https://github.com/bpftrace/bpftrace/blob/master/README.md#tools).
 
 - [hrtimersnoop](hrtimersnoop) - High-resolution timer latency tracing.
-- [mqsnoop](https://github.com/bpftrace/user-tools/tree/master/mqsnoop) -
-Trace POSIX message queue send.
-- [nfcttrace](https://github.com/bpftrace/user-tools/tree/master/nfcttrace) -
-Show entries about TCP&UDP in nf_conntrack.
-- [numasched](https://github.com/bpftrace/user-tools/tree/master/numasched) -
-Trace scheduling of system processes between NUMA nodes.
-- [sigsnoop](https://github.com/bpftrace/user-tools/tree/master/sigsnoop) -
-Trace standard and real-time signals.
+- [mqsnoop](mqsnoop) - Trace POSIX message queue send.
+- [nfcttrace](nfcttrace) - Show entries about TCP&UDP in nf_conntrack.
+- [numasched](numasched) - Trace scheduling of system processes between NUMA nodes.
+- [sigsnoop](sigsnoop) - Trace standard and real-time signals.
 - [wakesnoop](wakesnoop) - Task wakeup latency tracing.
