@@ -28,11 +28,9 @@ tracepoint:timer:hrtimer_expire_entry
 }
 
 tracepoint:timer:hrtimer_expire_exit
-/@function[args.hrtimer]/
+/@function[args.hrtimer] && @start[args.hrtimer]/
 {
-	if (@start[args.hrtimer]) {
-		$duration = (nsecs - @start[args.hrtimer]) / 1000;
-	}
+	$duration = (nsecs - @start[args.hrtimer]) / 1000;
 	if (@delay[args.hrtimer] >= (uint64)$1 || $duration >= (uint64)$2) {
 		printf("%-15s %-30s %8ld %8ld\n",
 			strftime("%H:%M:%S.%f", nsecs),
