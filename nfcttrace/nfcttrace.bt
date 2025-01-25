@@ -37,11 +37,12 @@ kprobe:nf_ct_delete
         if($original_tuple.src.l3num == AF_INET){
             $original_saddr = ntop(AF_INET, $original_tuple.src.u3.ip);
             $original_daddr = ntop(AF_INET, $original_tuple.dst.u3.ip);
+            printf(" osaddr=%s odaddr=%s", $original_saddr, $original_daddr);
         } else {
             $original_saddr = ntop(AF_INET6, $original_tuple.src.u3.all);
             $original_daddr = ntop(AF_INET6, $original_tuple.dst.u3.all);
+            printf(" osaddr=%s odaddr=%s", $original_saddr, $original_daddr);
         }
-        printf(" osaddr=%s odaddr=%s", $original_saddr, $original_daddr);
 
         // print port
         $original_sport = $original_tuple.src.u.all;
@@ -63,11 +64,12 @@ kprobe:nf_ct_delete
         if ($reply_tuple.src.l3num == AF_INET) {
             $reply_saddr = ntop(AF_INET, $reply_tuple.src.u3.ip);
             $reply_daddr = ntop(AF_INET, $reply_tuple.dst.u3.ip);
+            printf(" rsaddr=%s rdaddr=%s", $reply_saddr, $reply_daddr);
         } else {
             $reply_saddr = ntop(AF_INET6, $reply_tuple.src.u3.all);
             $reply_daddr = ntop(AF_INET6, $reply_tuple.dst.u3.all);
+            printf(" rsaddr=%s rdaddr=%s", $reply_saddr, $reply_daddr);
         }
-        printf(" rsaddr=%s rdaddr=%s", $reply_saddr, $reply_daddr);
 
         // print port
         $reply_sport = $reply_tuple.src.u.all;
