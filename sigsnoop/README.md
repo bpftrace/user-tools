@@ -5,17 +5,19 @@ This is done by instrumenting signal/signal_generate tracepoints.
 
 ## Output
 
+```
 $ sudo ./sigsnoop.bt
 Attaching 9 probes...
 Tracing signals, hit ctrl-c to end.
 TIME     PID      COMM             TPID     SIG
-09:42:33 214863   locate           214860   SIGCHLD
-09:42:33 214866   locate           214860   SIGCHLD
-09:42:33 214862   rpm              214861   SIGCHLD
-09:42:33 214868   rpm              214861   SIGCHLD
-09:42:33 214869   rpm              214861   SIGCHLD
-09:42:33 214870   uname            214861   SIGCHLD
-09:42:34 214879   rpm              214874   SIGCHLD
+08:25:28 195973   vte-urlencode-c  194760   SIGCHLD
+08:25:29 195974   ls               194760   SIGCHLD
+08:25:29 195975   vte-urlencode-c  194760   SIGCHLD
+08:25:29 1847     Xorg             1847     SIGALRM
+08:25:31 0        swapper/3        2594     SIGNAL-34
+08:25:31 1847     Xorg             1847     SIGALRM
+^CBye.
+```
 
-The first line shows that pid 214863 (locate thread) delivered a SIGCHLD 
-signal to pid 214860 (TPID = the target pid).
+The first line shows that pid 195973 (locate thread) delivered a SIGCHLD
+signal to pid 194760 (TPID = the target pid).

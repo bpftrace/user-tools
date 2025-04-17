@@ -47,6 +47,39 @@ BEGIN
 	@SIG_STR[29] = "SIGIO";
 	@SIG_STR[30] = "SIGPWR";
 	@SIG_STR[31] = "SIGSYS";
+	@SIG_STR[32] = "SIGNAL-32"; /* SIGRTMIN in kernel */
+	@SIG_STR[33] = "SIGNAL-33";
+	@SIG_STR[34] = "SIGNAL-34";
+	@SIG_STR[35] = "SIGNAL-35";
+	@SIG_STR[36] = "SIGNAL-36";
+	@SIG_STR[37] = "SIGNAL-37";
+	@SIG_STR[38] = "SIGNAL-38";
+	@SIG_STR[39] = "SIGNAL-39";
+	@SIG_STR[40] = "SIGNAL-40";
+	@SIG_STR[41] = "SIGNAL-41";
+	@SIG_STR[42] = "SIGNAL-42";
+	@SIG_STR[43] = "SIGNAL-43";
+	@SIG_STR[44] = "SIGNAL-44";
+	@SIG_STR[45] = "SIGNAL-45";
+	@SIG_STR[46] = "SIGNAL-46";
+	@SIG_STR[47] = "SIGNAL-47";
+	@SIG_STR[48] = "SIGNAL-48";
+	@SIG_STR[49] = "SIGNAL-49";
+	@SIG_STR[50] = "SIGNAL-50";
+	@SIG_STR[51] = "SIGNAL-51";
+	@SIG_STR[52] = "SIGNAL-52";
+	@SIG_STR[53] = "SIGNAL-53";
+	@SIG_STR[54] = "SIGNAL-54";
+	@SIG_STR[55] = "SIGNAL-55";
+	@SIG_STR[56] = "SIGNAL-56";
+	@SIG_STR[57] = "SIGNAL-57";
+	@SIG_STR[58] = "SIGNAL-58";
+	@SIG_STR[59] = "SIGNAL-59";
+	@SIG_STR[60] = "SIGNAL-60";
+	@SIG_STR[61] = "SIGNAL-61";
+	@SIG_STR[62] = "SIGNAL-62";
+	@SIG_STR[63] = "SIGNAL-63";
+	@SIG_STR[64] = "SIGNAL-64"; /* SIGRTMAX */
 
 	printf("Tracing signals, hit ctrl-c to end.\n");
 	printf("%-8s %-8s %-16s %-8s %-8s\n",
