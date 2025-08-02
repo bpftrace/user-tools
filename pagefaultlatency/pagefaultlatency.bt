@@ -1,0 +1,52 @@
+#!/usr/bin/bpftrace
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/*
+ * pagefaultlatency.bt    Pagefault latency tracing tool.
+ *
+ * USAGE: pagefaultlatency.bt [thread_name]
+ */
+
+BEGIN
+{
+    if ($# == 1) {
+        @proc = str($1);
+        printf("Tracing pagefault latency for comm[%s]\n", @proc);
+    } else {
+        printf("No command specified!\n");
+        exit();
+    }
+}
+
+kprobe:handle_mm_fault
+/comm == @proc/
+{
+    @start[tid] = nsecs();
+}
+
+kretprobe:handle_mm_fault
+/@start[tid]/
+{
+    @usecs = hist((nsecs - @start[tid]) / 1000);
+    $latency = nsecs() - @start[tid];
+    delete(@start[tid]);
+    printf("[%03d] latency=%d ns\n", @count, $latency);
+    @duration = sum($latency);
+    @count += 1;
+}
+
+END
+{
+    if (@count > 0) {
+        $avg = @duration / @count;
+        printf("Average pagefault time for comm[%s]: %d ns [cnt=%d]\n", @proc, $avg, @count);
+    } else {
+        printf("No pagefault recorded for comm[%s].\n", @proc);
+    }
+
+    clear(@proc);
+    clear(@count);
+    clear(@duration);
+    clear(@start);
+}
