@@ -1,0 +1,50 @@
+#!/bin/env bpftrace
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * slableaktracker.bt - Keeps track of to-be-freed slab objects
+ *                      from a specified slab cache. 
+ *
+ * USAGE: ./slableaktracker.bt <slab>
+ *
+ * Copyright (c) 2025 Charles Haithcock.
+ *
+ * 26-Oct-2025  Charles Haithcock  created this.
+ */
+
+config = {
+	print_maps_on_exit=0;
+	max_map_keys=65536;
+}
+
+BEGIN {
+	if ($# != 1) {
+		printf("\nERROR: Missing slab parameter to track.\n");
+		printf("USAGE: ./slableaktracker.bt <slab>\n");
+		exit(22); /* EINVAL */
+	}
+	printf("Starting slab user tracking for slab %s.\n", str($1));
+}
+
+tracepoint:kmem:kmem_cache_alloc /str(args.name) == str($1)/ {
+	if (len(@tracks) == 65536) {
+		exit();
+	}
+	@tracks[args.ptr] = (pid, comm, kstack(perf));
+}
+
+tracepoint:kmem:kmem_cache_free /str(args.name) == str($1)/ {
+	delete(@tracks, args.ptr);
+}
+
+END {
+	for ($track : @tracks) {
+		/* Key on kernel stacks */
+		@remaining_allocs[$track.1] = count();
+	}
+	print(@remaining_allocs);
+	printf("Remaining %s object count: %d\n", str($1), len(@tracks));
+	if (len(@tracks) == 65536) {
+		printf("Exiting early due to slab allocation information storage being full\n");
+	}
+	clear(@tracks);
+}

@@ -11,4 +11,5 @@ comprehensive list is available
 - [nfcttrace](nfcttrace) - Show entries about TCP&UDP in nf_conntrack.
 - [numasched](numasched) - Trace scheduling of system processes between NUMA nodes.
 - [sigsnoop](sigsnoop) - Trace standard and real-time signals.
+- [slableaktracker](slableaktracker) - Track down slab leaks.
 - [wakesnoop](wakesnoop) - Task wakeup latency tracing.
