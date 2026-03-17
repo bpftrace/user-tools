@@ -15,32 +15,32 @@ One intention is that all new official tools begin life in this repository. And
 over time we'll develop some criteria for promoting a user tool to an official
 tool that bpftrace maintainers will help support over long periods of time.
 
-[0]: https://github.com/bpftrace/bpftrace/blob/master/CONTRIBUTING-TOOLS.md
+[0]: https://github.com/bpftrace/bpftrace/blob/master/CONTRIBUTING.md#contributing-tools
 
 ## [Tools List](TOOLS.md)
 
 ## [How to Contribute a New Tool](CONTRIBUTING.md)
 
-If you want to contribute bpftrace tools to this repo, please follow 
+If you want to contribute bpftrace tools to this repo, please follow
 [these guidelines](CONTRIBUTING.md).
 
 ## Packaging
 
 This repository **should NOT be packaged and distributed**. It is essentially a
-large collection of unsupported, possibly broken, sample code. This is not a 
+large collection of unsupported, possibly broken, sample code. This is not a
 typical software project but rather a programmer's community, similar to a
 subreddit. The only bpftrace tools that are packaged are those included in the
 primary [bpftrace repository](https://github.com/bpftrace/bpftrace/tree/master/tools).
 
 ## Licensing
 
-Depending on which [BPF helpers](kernel-versions.md#helpers) are used by 
-bpftrace when compiling your program, a GPL-compatible license is required for 
+Depending on which [BPF helpers](kernel-versions.md#helpers) are used by
+bpftrace when compiling your program, a GPL-compatible license is required for
 bpftrace programs/tools.
 
-You can set the license as a comment in your source code (at the top of the 
-file). Note: it supports multiple words and quotes are not necessary. **If the 
-license is not specified, bpftrace will automatically define the license of the 
+You can set the license as a comment in your source code (at the top of the
+file). Note: it supports multiple words and quotes are not necessary. **If the
+license is not specified, bpftrace will automatically define the license of the
 program as GPL v2.**
 
 Examples:
