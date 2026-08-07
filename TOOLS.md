@@ -12,6 +12,7 @@ comprehensive list is available
 - [numasched](numasched) - Trace scheduling of system processes between NUMA nodes.
 - [pagefaultlatency](pagefaultlatency) - Page fault latency tracing.
 - [reclaimlockmonitor](reclaimlockmonitor) - Monitor sleeping locks held during memory reclaim.
+- [runnablelockmonitor](runnablelockmonitor) - Monitor sleeping locks held while off-CPU.
 - [sigsnoop](sigsnoop) - Trace standard and real-time signals.
 - [slableaktracker](slableaktracker) - Track down slab leaks.
 - [wakesnoop](wakesnoop) - Task wakeup latency tracing.
