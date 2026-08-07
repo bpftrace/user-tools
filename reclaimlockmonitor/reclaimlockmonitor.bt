@@ -1,0 +1,475 @@
+#!/usr/bin/env bpftrace
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * reclaimlockmonitor.bt - Monitor sleeping locks held during memory reclaim.
+ *                         For Linux, uses bpftrace and eBPF.
+ *
+ * Tracks mutex, rw_semaphore, and percpu_rw_semaphore (write side)
+ * acquisitions/releases system-wide, against vmscan direct + memcg reclaim.
+ *
+ * On unlock of a lock held during reclaim, emits: reclaim time while held,
+ * hold time, waiter status, the acquire-site kstack, and the reclaim-entry
+ * kstack of the longest reclaim episode.
+ *
+ * In-flight holders: locks still held when the script stops (never reaching an
+ * unlock) are emitted by the END action, tagged [INFLIGHT]; their hold and
+ * reclaim times are lower bounds.  A remote task's stack can't be sampled at
+ * END, so holder identity (pid/thread/process name) and the acquire stack are
+ * captured at the acquire site and stored in @held.
+ *
+ * percpu-rwsem: only the write side is traced -- percpu_down/up_read() are
+ * inlined per-CPU counter bumps with no symbol to probe.  The write side is
+ * the high-value case anyway: an exclusive writer stalled in reclaim blocks
+ * all readers and writers.
+ *
+ * Nesting: up to 8 held locks per task, non-LIFO unlock via search-and-swap.
+ * Reclaim does not nest, so begin/end pairs are handled directly.
+ *
+ * USAGE:
+ *   ./reclaimlockmonitor.bt                        # all locks seen in reclaim
+ *   ./reclaimlockmonitor.bt -- --waiters_only=true # contended locks only
+ *
+ * --waiters_only=true suppresses reports for locks that had no waiter at
+ * release, which is usually most of them.  A lock nobody was waiting on did
+ * not actually stall anyone, so this cuts the output down to the reports that
+ * represent real contention.
+ *
+ * WARNING: Tracing all mutex/rwsem ops system-wide has significant overhead;
+ * the per-acquire kstack capture adds to it.  Keep run windows short.
+ *
+ * Requires: CONFIG_DEBUG_INFO_BTF=y
+ *
+ * Copyright (c) 2026 Shakeel Butt.
+ */
+
+config = {
+	max_map_keys = 262144;
+	missing_probes = warn;
+}
+
+let @lock_depth = lruhash(262144);
+
+macro waiters_only() {
+	getopt("waiters_only", false)
+}
+
+/*
+ * pend_acquire - record a pending acquisition at kprobe entry.  PID, thread
+ * name, and the kstack are captured here (call site, where the stack is intact
+ * -- a kretprobe trampoline can corrupt the unwind) and carried through @pend
+ * to @held.  The process name is captured when the acquisition commits.
+ */
+macro pend_acquire(@pend, type) {
+	@pend[tid] = (lock = arg0, type = (uint64)type,
+		      pid = pid, comm = comm, kstack = kstack);
+}
+
+/*
+ * commit_acquire - at kretprobe, move the @pend record (with its acquire-site
+ * identity/stacks) onto @held, deleting @pend only when it was found.  Call
+ * unconditionally for void-return locks; for failable locks, guard the call
+ * with `if (retval == 0)` and delete @pend in the else at the call site.
+ */
+macro commit_acquire(@pend, @held, @lock_depth) {
+	let $pend;
+	if (find(@pend, tid, $pend)) {
+		$d = @lock_depth[tid];
+		if ($d < 8) {
+			@held[tid, $d] = (lock = $pend.lock,
+					  type = $pend.type,
+					  time = nsecs,
+					  pid = $pend.pid,
+					  comm = $pend.comm,
+					  process_name =
+						str(curtask->group_leader->comm, 16),
+					  kstack = $pend.kstack);
+			@lock_depth[tid] = $d + 1;
+		}
+		_ = delete(@pend, tid);
+	}
+}
+
+/* taint_held_locks - OR a taint bit (1=global, 2=memcg) into all held locks. */
+macro taint_held_locks(@held, @lock_depth, @tainted, bit) {
+	$depth = @lock_depth[tid];
+	$i = (int64)0;
+	unroll(8) {
+		if ($i < $depth) {
+			$lk = @held[tid, $i].lock;
+			@tainted[tid, $lk] = @tainted[tid, $lk] | bit;
+		}
+		$i++;
+	}
+}
+
+/*
+ * report_reclaim_lock - report one lock held during reclaim.  Shared by the
+ * unlock path (inflight=false) and the END walk (inflight=true); all inputs are
+ * passed explicitly so it can describe a task other than the current one, and
+ * untainted locks are skipped.  Waiter status and the lock-type string come
+ * from the stored type (no per-call-site struct knowledge):
+ *   mutex  (1):   MUTEX_FLAG_WAITERS = owner.counter bit 0
+ *   rwsem  (2/3): RWSEM_FLAG_WAITERS = count.counter bit 1
+ *   percpu (4):   sem->waiters non-empty, tested as (head.next - &head) so the
+ *                 (bool) cast has an integer operand (bpftrace rejects casting a
+ *                 bool "!=" result); &head via offsetof (spinlock size varies).
+ * Does not mutate @tainted/@reclaim_accum -- release_lock() clears them after,
+ * keeping the END for-each callback cheap.
+ */
+macro report_reclaim_lock(@reclaim_accum, @reclaim_start, @reclaim_kstack,
+			  @reclaim_max, @tainted,
+			  rtid, rlock, rtype_num, racq_ns,
+			  rpid, rcomm, rprocess_name, rkstack,
+			  inflight) {
+	let $taint_type;
+	if (find(@tainted, (rtid, rlock), $taint_type)) {
+		$reclaim_ns = (uint64)@reclaim_accum[rtid, rlock];
+		if (@reclaim_start[rtid]) {
+			$partial = (int64)nsecs - (int64)@reclaim_start[rtid];
+			$reclaim_ns += (uint64)$partial;
+			/*
+			 * A reclaim still in progress is also an episode; let it
+			 * compete for "longest" via its begin stack (folds in the
+			 * ongoing episode for an in-flight holder at END too).
+			 */
+			if ($partial > @reclaim_max[rtid, rlock].time) {
+				@reclaim_max[rtid, rlock] =
+					(time = $partial, kstack = @reclaim_kstack[rtid]);
+			}
+		}
+		$reclaim_us = $reclaim_ns / (uint64)1000;
+		$hold_us = (uint64)((int64)nsecs - (int64)racq_ns) / (uint64)1000;
+		$waiters = rtype_num == 1
+			? (bool)(((struct mutex *)rlock)->owner.counter & 0x01)
+			: (rtype_num == 4
+				? (bool)((int64)(uint64)(((struct percpu_rw_semaphore *)rlock)->waiters.head.next) -
+					(int64)(rlock +
+						offsetof(struct percpu_rw_semaphore, waiters) +
+						offsetof(struct wait_queue_head, head)))
+				: (bool)(((struct rw_semaphore *)rlock)->count.counter & 0x02));
+		$rtype = $taint_type == 1 ? "global" :
+			($taint_type == 2 ? "memcg" : "both");
+		$ltype = rtype_num == 1 ? "mutex" :
+			(rtype_num == 2 ? "rwsem read" :
+			 (rtype_num == 3 ? "rwsem write" : "percpu-rwsem write"));
+		if ($waiters || !waiters_only()) {
+			printf(">>> RECLAIM_LOCK: %s %p%s%s\n",
+				$ltype, rlock,
+				$waiters ? " [WAITERS]" : "",
+				inflight ? " [INFLIGHT]" : "");
+			printf("    hold=%llu us  reclaim=%llu us  reclaim_type=%s\n",
+				$hold_us, $reclaim_us, $rtype);
+			printf("    pid=%-8d tid=%-8d process=%s thread=%s\n",
+				rpid, rtid, rprocess_name, rcomm);
+			printf("    acquire stack:\n");
+			print(rkstack);
+			printf("    reclaim-entry stack (longest episode):\n");
+			print(@reclaim_max[rtid, rlock].kstack);
+		}
+	}
+}
+
+/*
+ * release_lock - find the released lock in the held array (handles non-LIFO
+ * order), report it via report_reclaim_lock() (inflight=false), drop its
+ * reclaim bookkeeping, and compact the array.  The reclaim-map deletes are
+ * unconditional (no-op if untainted) so report_reclaim_lock() stays delete-free
+ * and reusable in the END for-each callback.
+ */
+macro release_lock(@held, @lock_depth, @tainted, @reclaim_accum,
+		   @reclaim_start, @reclaim_kstack, @reclaim_max) {
+	$lock = arg0;
+	$depth = @lock_depth[tid];
+
+	$found = (int64)-1;
+	$i = (int64)0;
+	unroll(8) {
+		if ($i < $depth && @held[tid, $i].lock == $lock) {
+			$found = $i;
+		}
+		$i++;
+	}
+
+	if ($found >= 0) {
+		$e = @held[tid, $found];
+		report_reclaim_lock(@reclaim_accum, @reclaim_start, @reclaim_kstack,
+			@reclaim_max, @tainted,
+			tid, $lock, $e.type, $e.time,
+			$e.pid, $e.comm, $e.process_name, $e.kstack,
+			false);
+		_ = delete(@tainted, (tid, $lock));
+		_ = delete(@reclaim_accum, (tid, $lock));
+		_ = delete(@reclaim_max, (tid, $lock));
+
+		$last = $depth - 1;
+		if ($found != $last) {
+			@held[tid, $found] = @held[tid, $last];
+		}
+		_ = delete(@held, (tid, $last));
+		@lock_depth[tid] = $last;
+	}
+}
+
+/*
+ * =====================================================================
+ * LOCK ACQUISITION
+ *
+ * Save the lock, type, holder identity, and acquire-site stacks into @pend at
+ * kprobe entry; commit (with acquire timestamp) at the kretprobe, where the
+ * lock is known held.
+ *
+ * Types: 1 = mutex, 2 = rwsem read, 3 = rwsem write,
+ *        4 = percpu-rwsem write
+ * =====================================================================
+ */
+
+/* --- mutex_lock (void return, always succeeds) --- */
+
+kprobe:mutex_lock
+{
+	pend_acquire(@pend, 1);
+}
+
+kretprobe:mutex_lock
+{
+	commit_acquire(@pend, @held, @lock_depth);
+}
+
+/* --- mutex_lock_interruptible / mutex_lock_killable (return 0 on success) --- */
+
+kprobe:mutex_lock_interruptible,
+kprobe:mutex_lock_killable
+{
+	pend_acquire(@pend, 1);
+}
+
+kretprobe:mutex_lock_interruptible,
+kretprobe:mutex_lock_killable
+{
+	if (retval == 0) {
+		commit_acquire(@pend, @held, @lock_depth);
+	} else {
+		_ = delete(@pend, tid);
+	}
+}
+
+/* --- down_read (void return) --- */
+
+kprobe:down_read
+{
+	pend_acquire(@pend, 2);
+}
+
+kretprobe:down_read
+{
+	commit_acquire(@pend, @held, @lock_depth);
+}
+
+/* --- down_read_interruptible / down_read_killable (return 0 on success) --- */
+
+kprobe:down_read_interruptible,
+kprobe:down_read_killable
+{
+	pend_acquire(@pend, 2);
+}
+
+kretprobe:down_read_interruptible,
+kretprobe:down_read_killable
+{
+	if (retval == 0) {
+		commit_acquire(@pend, @held, @lock_depth);
+	} else {
+		_ = delete(@pend, tid);
+	}
+}
+
+/* --- down_write (void return) --- */
+
+kprobe:down_write
+{
+	pend_acquire(@pend, 3);
+}
+
+kretprobe:down_write
+{
+	commit_acquire(@pend, @held, @lock_depth);
+}
+
+/* --- down_write_killable (return 0 on success) --- */
+
+kprobe:down_write_killable
+{
+	pend_acquire(@pend, 3);
+}
+
+kretprobe:down_write_killable
+{
+	if (retval == 0) {
+		commit_acquire(@pend, @held, @lock_depth);
+	} else {
+		_ = delete(@pend, tid);
+	}
+}
+
+/* --- percpu_down_write (void return; read side not traceable, see top) --- */
+
+kprobe:percpu_down_write
+{
+	pend_acquire(@pend, 4);
+}
+
+kretprobe:percpu_down_write
+{
+	commit_acquire(@pend, @held, @lock_depth);
+}
+
+/*
+ * =====================================================================
+ * RECLAIM TRACKING (vmscan tracepoints)
+ *
+ * Begin: record start time, capture the reclaim-entry kstack (if holding a
+ * lock), and taint all held locks (1=global, 2=memcg, OR'd).
+ * End: add elapsed to each tainted lock's @reclaim_accum and keep the longest
+ * episode in @reclaim_max[tid, lock] = (time, begin-kstack).
+ * No output here -- reported at unlock, or in END for a still-held lock.
+ * =====================================================================
+ */
+
+/* Global (direct) reclaim: taint type bit 0 */
+tracepoint:vmscan:mm_vmscan_direct_reclaim_begin
+/ curtask->in_memstall /
+{
+	@reclaim_start[tid] = nsecs;
+	/* Stack of the allocation entering reclaim; only useful if we hold a lock. */
+	if (@lock_depth[tid] > 0) {
+		@reclaim_kstack[tid] = kstack;
+	}
+	taint_held_locks(@held, @lock_depth, @tainted, 1);
+}
+
+/* Memcg reclaim: taint type bit 1 */
+tracepoint:vmscan:mm_vmscan_memcg_reclaim_begin
+/ curtask->in_memstall /
+{
+	@reclaim_start[tid] = nsecs;
+	/* Stack of the allocation entering reclaim; only useful if we hold a lock. */
+	if (@lock_depth[tid] > 0) {
+		@reclaim_kstack[tid] = kstack;
+	}
+	taint_held_locks(@held, @lock_depth, @tainted, 2);
+}
+
+tracepoint:vmscan:mm_vmscan_direct_reclaim_end,
+tracepoint:vmscan:mm_vmscan_memcg_reclaim_end
+/ curtask->in_memstall /
+{
+	/* Add elapsed to each tainted held lock; track the longest episode. */
+	$elapsed = (int64)nsecs - (int64)@reclaim_start[tid];
+	$depth = @lock_depth[tid];
+	$i = (int64)0;
+	unroll(8) {
+		if ($i < $depth) {
+			$lk = @held[tid, $i].lock;
+			if (@tainted[tid, $lk]) {
+				@reclaim_accum[tid, $lk] += $elapsed;
+				if ($elapsed > @reclaim_max[tid, $lk].time) {
+					@reclaim_max[tid, $lk] = (time = $elapsed, kstack = @reclaim_kstack[tid]);
+				}
+			}
+		}
+		$i++;
+	}
+	_ = delete(@reclaim_start, tid);
+	_ = delete(@reclaim_kstack, tid);
+}
+
+/*
+ * =====================================================================
+ * LOCK RELEASE
+ *
+ * Each unlock handler delegates to release_lock(); waiter detection and the
+ * lock-type string come from the stored type in report_reclaim_lock(), so the
+ * unlock probes pass no per-lock struct details.
+ * =====================================================================
+ */
+
+kprobe:mutex_unlock
+{
+	release_lock(@held, @lock_depth, @tainted, @reclaim_accum,
+		@reclaim_start, @reclaim_kstack, @reclaim_max);
+}
+
+kprobe:up_read
+{
+	release_lock(@held, @lock_depth, @tainted, @reclaim_accum,
+		@reclaim_start, @reclaim_kstack, @reclaim_max);
+}
+
+kprobe:up_write
+{
+	release_lock(@held, @lock_depth, @tainted, @reclaim_accum,
+		@reclaim_start, @reclaim_kstack, @reclaim_max);
+}
+
+kprobe:percpu_up_write
+{
+	release_lock(@held, @lock_depth, @tainted, @reclaim_accum,
+		@reclaim_start, @reclaim_kstack, @reclaim_max);
+}
+
+/*
+ * =====================================================================
+ * CLEANUP ON THREAD EXIT
+ *
+ * Drop residual map entries left by a task exiting mid-flight or by missed
+ * (inlined) lock/unlock probes.
+ * =====================================================================
+ */
+
+tracepoint:sched:sched_process_exit
+{
+	$depth = @lock_depth[tid];
+	$i = (int64)0;
+	unroll(8) {
+		if ($i < $depth) {
+			$lock = @held[tid, $i].lock;
+			_ = delete(@tainted, (tid, $lock));
+			_ = delete(@reclaim_accum, (tid, $lock));
+			_ = delete(@reclaim_max, (tid, $lock));
+			_ = delete(@held, (tid, $i));
+		}
+		$i++;
+	}
+	_ = delete(@lock_depth, tid);
+	_ = delete(@pend, tid);
+	_ = delete(@reclaim_start, tid);
+	_ = delete(@reclaim_kstack, tid);
+}
+
+END
+{
+	/*
+	 * In-flight holders: locks still held at exit that saw reclaim.  Hold and
+	 * reclaim time is still growing, so emit with inflight=true using the
+	 * acquire-site identity/stacks in @held (a remote stack can't be sampled
+	 * here).  report_reclaim_lock() skips untainted entries.
+	 */
+	for ($kv : @held) {
+		$rtid = $kv.0.0;
+		$e = $kv.1;
+		report_reclaim_lock(@reclaim_accum, @reclaim_start, @reclaim_kstack,
+			@reclaim_max, @tainted,
+			$rtid, $e.lock, $e.type, $e.time,
+			$e.pid, $e.comm, $e.process_name, $e.kstack,
+			true);
+	}
+
+	clear(@pend);
+	clear(@held);
+	clear(@lock_depth);
+	clear(@tainted);
+	clear(@reclaim_accum);
+	clear(@reclaim_start);
+	clear(@reclaim_kstack);
+	clear(@reclaim_max);
+}
