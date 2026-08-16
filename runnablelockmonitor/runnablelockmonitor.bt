@@ -1,0 +1,629 @@
+#!/usr/bin/env bpftrace
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * runnablelockmonitor.bt - Monitor sleeping locks held while off-CPU.
+ *                          For Linux, uses bpftrace and eBPF.
+ *
+ * Tracks mutex, rw_semaphore, and percpu_rw_semaphore (write side)
+ * acquisitions/releases system-wide.  Uses sched_switch / sched_wakeup to
+ * split the time a lock is held off-CPU into two bands:
+ *
+ *   RUNNABLE - holder on the run queue but not executing (lost the CPU to
+ *              preemption, CPU contention, or throttling).
+ *   SLEEPING - holder left the run queue blocked on an event (nested lock,
+ *              RCU, reclaim, I/O, ...); the block-site kstack says what.
+ *
+ * prev_state from sched_switch (__trace_sched_switch_state()): 0 (voluntary
+ * schedule while TASK_RUNNING) and 256 (TASK_REPORT_MAX involuntary preempt /
+ * cond_resched) are RUNNABLE; &1 (S) / &2 (D) are SLEEPING.  A lock holder
+ * preempted in kernel context reports 256, not 0.
+ *
+ * On unlock of a lock that spent time off-CPU, emits: accumulated RUNNABLE and
+ * SLEEPING time while held, the largest single episode of each band and its
+ * stack, waiter status, hold time, and the acquire-site kstack.
+ *
+ * THROTTLE tag: a RUNNABLE episode begun while the holder's CFS hierarchy is
+ * throttled (cfs_rq->throttle_count > 0) is tagged (@tainted & 4) and reported
+ * as [THROTTLED].  Only inline-throttle kernels dequeue a running lock holder;
+ * kernels that defer cpu.max throttling to exit-to-user (throttle_cfs_rq_work)
+ * never throttle a holder mid-critical-section, so that symbol's presence
+ * (kfunc_exist(), folded at compile time via deferred_throttle()) suppresses
+ * the tag.  On inline kernels the symbol is absent so the builtin folds to
+ * false and the tag stays live.
+ *
+ * In-flight holders: locks still held when the script stops are emitted by the
+ * END action, tagged [INFLIGHT]; their off-CPU time is still accruing and a
+ * remote holder may be off-CPU right now.  A remote task's stack can't be
+ * sampled at END, so holder identity (pid/thread/process name) and the acquire
+ * stack are captured at the acquire site and stored in @held.
+ *
+ * percpu-rwsem: only the write side is traced -- percpu_down/up_read() are
+ * inlined per-CPU counter bumps with no symbol to probe.  An exclusive writer
+ * that loses the CPU while held blocks all readers and writers.
+ *
+ * Nesting: up to 8 held locks per task, non-LIFO unlock via search-and-swap.
+ *
+ * USAGE:
+ *   ./runnablelockmonitor.bt                          # both bands >= 5000 us
+ *   ./runnablelockmonitor.bt -- --waiters_only=true   # contended locks only
+ *   ./runnablelockmonitor.bt -- --min_runnable_us=500 # runnable >= 500 us
+ *   ./runnablelockmonitor.bt -- --min_sleep_us=500    # sleeping >= 500 us
+ * A lock is reported if EITHER band crosses its threshold.
+ *
+ * WARNING: sched_switch fires very frequently, and the per-acquire kstack
+ * capture adds to it.  Significant overhead -- keep runs short.
+ *
+ * Requires: CONFIG_DEBUG_INFO_BTF=y
+ *
+ * Copyright (c) 2026 Shakeel Butt.
+ */
+
+config = {
+	max_map_keys = 262144;
+	missing_probes = warn;
+}
+
+let @lock_depth = lruhash(262144);
+
+macro waiters_only() {
+	getopt("waiters_only", false)
+}
+
+macro min_runnable_us() {
+	getopt("min_runnable_us", 5000)
+}
+
+macro min_sleep_us() {
+	getopt("min_sleep_us", 5000)
+}
+
+/*
+ * deferred_throttle - compile-time true on defer-throttle kernels, where
+ * cpu.max throttling is deferred to exit-to-userspace (throttle_cfs_rq_work)
+ * and a lock holder is never throttled off-CPU mid-critical-section.  The
+ * throttle tag is suppressed there; on inline kernels the symbol is absent so
+ * kfunc_exist() folds to false and the tag stays live.
+ */
+macro deferred_throttle() {
+	kfunc_exist("throttle_cfs_rq_work")
+}
+
+/*
+ * pend_acquire - record a pending acquisition at kprobe entry.  PID, thread
+ * name, nr_cpus_allowed (size of the holder's CPU affinity mask), and the
+ * kstack are captured here (call site, where the stack is intact -- a kretprobe
+ * trampoline can corrupt the unwind) and carried through @pend to @held.  The
+ * process name is captured when the acquisition commits.
+ */
+macro pend_acquire(@pend, type) {
+	@pend[tid] = (lock = arg0, type = (uint64)type,
+		      pid = pid, comm = comm,
+		      nr_cpus_allowed = curtask->nr_cpus_allowed,
+		      kstack = kstack);
+}
+
+/*
+ * commit_acquire - at kretprobe, move the @pend record (with its acquire-site
+ * identity/stack) onto @held, deleting @pend only when it was found.  Call
+ * unconditionally for void-return locks; for failable locks, guard the call
+ * with `if (retval == 0)` and delete @pend in the else at the call site.
+ */
+macro commit_acquire(@pend, @held, @lock_depth) {
+	let $pend;
+	if (find(@pend, tid, $pend)) {
+		$d = @lock_depth[tid];
+		if ($d < 8) {
+			@held[tid, $d] = (lock = $pend.lock,
+					  type = $pend.type,
+					  time = nsecs,
+					  pid = $pend.pid,
+					  comm = $pend.comm,
+					  process_name =
+						str(curtask->group_leader->comm, 16),
+					  nr_cpus_allowed = $pend.nr_cpus_allowed,
+					  kstack = $pend.kstack);
+			@lock_depth[tid] = $d + 1;
+		}
+		_ = delete(@pend, tid);
+	}
+}
+
+/*
+ * taint_held_locks - OR `bits` (1 = runnable, 2 = sleeping, 4 = throttled) into
+ * every held lock of target_tid (which may differ from the current task, e.g. a
+ * woken task).  All bands share one @tainted map to keep the map footprint
+ * loadable.
+ */
+macro taint_held_locks(@held, @lock_depth, @tainted, target_tid, bits) {
+	let $td;
+	if (find(@lock_depth, target_tid, $td)) {
+		$depth = $td;
+		$i = (int64)0;
+		unroll(8) {
+			if ($i < $depth) {
+				$lk = @held[target_tid, $i].lock;
+				@tainted[target_tid, $lk] =
+					@tainted[target_tid, $lk] | bits;
+			}
+			$i++;
+		}
+	}
+}
+
+/*
+ * report_offcpu_lock - report one lock that spent time off-CPU while held.
+ * Shared by the unlock path (inflight=false) and the END walk (inflight=true);
+ * all inputs are passed explicitly so it can describe a task other than the
+ * current one.  Adds any still-open partial episode: a RUNNABLE one (@runnable
+ * _start, rare at unlock) and -- for a remote holder still sleeping at END -- a
+ * SLEEPING one (@sleep_info).  Waiter status and the lock-type string come from
+ * the stored type (no per-call-site struct knowledge):
+ *   mutex  (1):   MUTEX_FLAG_WAITERS = owner.counter bit 0
+ *   rwsem  (2/3): RWSEM_FLAG_WAITERS = count.counter bit 1
+ *   percpu (4):   sem->waiters non-empty, tested as (head.next - &head) so the
+ *                 (bool) cast has an integer operand (bpftrace rejects casting a
+ *                 bool "!=" result); &head via offsetof (spinlock size varies).
+ * Reports if EITHER band crosses its threshold.  Does not mutate the accum/max
+ * maps beyond the partial-episode update; release_lock() clears them after.
+ */
+macro report_offcpu_lock(@runnable_accum, @runnable_start, @runnable_kstack,
+			 @runnable_max, @sleep_accum, @sleep_max, @sleep_info,
+			 @tainted, rtid, rlock, rtype_num, racq_ns,
+			 rpid, rcomm, rprocess_name, rnr_cpus_allowed,
+			 rkstack, inflight) {
+	let $taint;
+	if (find(@tainted, (rtid, rlock), $taint)) {
+		/*
+		 * Add each band's still-open partial episode, clipped to this
+		 * holding: counted only when it began at/after the acquire (racq_ns),
+		 * so a stale runnable_start/sleep_info from an earlier holding of a
+		 * reused lock address can't make a band exceed hold time.
+		 */
+		$runnable_ns = (uint64)@runnable_accum[rtid, rlock];
+		if (@runnable_start[rtid] &&
+		    (int64)@runnable_start[rtid] >= (int64)racq_ns) {
+			$rpart = (int64)nsecs - (int64)@runnable_start[rtid];
+			$runnable_ns += (uint64)$rpart;
+			if ($rpart > @runnable_max[rtid, rlock].time) {
+				@runnable_max[rtid, rlock] = (time = $rpart, kstack = @runnable_kstack[rtid]);
+			}
+		}
+		$runnable_us = $runnable_ns / (uint64)1000;
+		$max_runnable_us = (uint64)@runnable_max[rtid, rlock].time / (uint64)1000;
+
+		$sleep_ns = (uint64)@sleep_accum[rtid, rlock];
+		let $si_rec;
+		if (find(@sleep_info, rtid, $si_rec) &&
+		    $si_rec.time >= (int64)racq_ns) {
+			$spart = (int64)nsecs - $si_rec.time;
+			$sleep_ns += (uint64)$spart;
+			if ($spart > @sleep_max[rtid, rlock].time) {
+				@sleep_max[rtid, rlock] = (time = $spart, kstack = $si_rec.kstack);
+			}
+		}
+		$sleep_us = $sleep_ns / (uint64)1000;
+		$max_sleep_us = (uint64)@sleep_max[rtid, rlock].time / (uint64)1000;
+
+		$hold_us = (uint64)((int64)nsecs - (int64)racq_ns) / (uint64)1000;
+		$waiters = rtype_num == 1
+			? (bool)(((struct mutex *)rlock)->owner.counter & 0x01)
+			: (rtype_num == 4
+				? (bool)((int64)(uint64)(((struct percpu_rw_semaphore *)rlock)->waiters.head.next) -
+					(int64)(rlock +
+						offsetof(struct percpu_rw_semaphore, waiters) +
+						offsetof(struct wait_queue_head, head)))
+				: (bool)(((struct rw_semaphore *)rlock)->count.counter & 0x02));
+		$ltype = rtype_num == 1 ? "mutex" :
+			(rtype_num == 2 ? "rwsem read" :
+			 (rtype_num == 3 ? "rwsem write" : "percpu-rwsem write"));
+		/* @tainted value for this held lock; & 4 = a throttle episode occurred */
+		$is_throttle = $taint & 4;
+		if (($runnable_us >= min_runnable_us() ||
+		     $sleep_us >= min_sleep_us()) &&
+		    ($waiters || !waiters_only())) {
+			printf(">>> OFFCPU_LOCK: %s %p\n", $ltype, rlock);
+			printf("    hold=%llu us%s%s%s\n",
+				$hold_us,
+				$waiters ? "  [WAITERS]" : "",
+				$is_throttle ? "  [THROTTLED]" : "",
+				inflight ? "  [INFLIGHT]" : "");
+			printf("    runnable=%llu us (max episode %llu us)\n",
+				$runnable_us, $max_runnable_us);
+			printf("    sleeping=%llu us (max episode %llu us)\n",
+				$sleep_us, $max_sleep_us);
+			printf("    pid=%-8d tid=%-8d process=%s thread=%s\n",
+				rpid, rtid, rprocess_name, rcomm);
+			printf("    allowed_cpus=%d of %d system cpus\n",
+				rnr_cpus_allowed, ncpus);
+			printf("    acquire stack:\n");
+			print(rkstack);
+			if ($max_runnable_us) {
+				printf("    largest runnable-episode (%s) stack:\n",
+					$is_throttle ? "throttle" : "preempt");
+				print(@runnable_max[rtid, rlock].kstack);
+			}
+			if ($max_sleep_us) {
+				printf("    largest sleep-episode (block-site) stack:\n");
+				print(@sleep_max[rtid, rlock].kstack);
+			}
+		}
+	}
+}
+
+/*
+ * release_lock - find the released lock in the held array (handles non-LIFO
+ * order), report it via report_offcpu_lock() (inflight=false), drop its
+ * per-band bookkeeping, and compact the array.  The map deletes are
+ * unconditional (no-op if untainted) so report_offcpu_lock() stays delete-free
+ * and reusable in the END for-each callback.
+ */
+macro release_lock(@held, @lock_depth, @tainted, @runnable_accum,
+		   @runnable_start, @runnable_kstack, @runnable_max,
+		   @sleep_accum, @sleep_max, @sleep_info) {
+	$lock = arg0;
+	$depth = @lock_depth[tid];
+
+	$found = (int64)-1;
+	$i = (int64)0;
+	unroll(8) {
+		if ($i < $depth && @held[tid, $i].lock == $lock) {
+			$found = $i;
+		}
+		$i++;
+	}
+
+	if ($found >= 0) {
+		$e = @held[tid, $found];
+		report_offcpu_lock(@runnable_accum, @runnable_start, @runnable_kstack,
+			@runnable_max, @sleep_accum, @sleep_max, @sleep_info, @tainted,
+			tid, $lock, $e.type, $e.time,
+			$e.pid, $e.comm, $e.process_name, $e.nr_cpus_allowed,
+			$e.kstack, false);
+		_ = delete(@tainted, (tid, $lock));
+		_ = delete(@runnable_accum, (tid, $lock));
+		_ = delete(@runnable_max, (tid, $lock));
+		_ = delete(@sleep_accum, (tid, $lock));
+		_ = delete(@sleep_max, (tid, $lock));
+
+		$last = $depth - 1;
+		if ($found != $last) {
+			@held[tid, $found] = @held[tid, $last];
+		}
+		_ = delete(@held, (tid, $last));
+		@lock_depth[tid] = $last;
+	}
+}
+
+/*
+ * =====================================================================
+ * LOCK ACQUISITION
+ *
+ * Save the lock, type, holder identity, and acquire-site stack into @pend at
+ * kprobe entry; commit (with acquire timestamp) at the kretprobe, where the
+ * lock is known held.
+ *
+ * Types: 1 = mutex, 2 = rwsem read, 3 = rwsem write,
+ *        4 = percpu-rwsem write
+ * =====================================================================
+ */
+
+/* --- mutex_lock (void return, always succeeds) --- */
+
+kprobe:mutex_lock
+{
+	pend_acquire(@pend, 1);
+}
+
+kretprobe:mutex_lock
+{
+	commit_acquire(@pend, @held, @lock_depth);
+}
+
+/* --- mutex_lock_interruptible / mutex_lock_killable (return 0 on success) --- */
+
+kprobe:mutex_lock_interruptible,
+kprobe:mutex_lock_killable
+{
+	pend_acquire(@pend, 1);
+}
+
+kretprobe:mutex_lock_interruptible,
+kretprobe:mutex_lock_killable
+{
+	if (retval == 0) {
+		commit_acquire(@pend, @held, @lock_depth);
+	} else {
+		_ = delete(@pend, tid);
+	}
+}
+
+/* --- down_read (void return) --- */
+
+kprobe:down_read
+{
+	pend_acquire(@pend, 2);
+}
+
+kretprobe:down_read
+{
+	commit_acquire(@pend, @held, @lock_depth);
+}
+
+/* --- down_read_interruptible / down_read_killable (return 0 on success) --- */
+
+kprobe:down_read_interruptible,
+kprobe:down_read_killable
+{
+	pend_acquire(@pend, 2);
+}
+
+kretprobe:down_read_interruptible,
+kretprobe:down_read_killable
+{
+	if (retval == 0) {
+		commit_acquire(@pend, @held, @lock_depth);
+	} else {
+		_ = delete(@pend, tid);
+	}
+}
+
+/* --- down_write (void return) --- */
+
+kprobe:down_write
+{
+	pend_acquire(@pend, 3);
+}
+
+kretprobe:down_write
+{
+	commit_acquire(@pend, @held, @lock_depth);
+}
+
+/* --- down_write_killable (return 0 on success) --- */
+
+kprobe:down_write_killable
+{
+	pend_acquire(@pend, 3);
+}
+
+kretprobe:down_write_killable
+{
+	if (retval == 0) {
+		commit_acquire(@pend, @held, @lock_depth);
+	} else {
+		_ = delete(@pend, tid);
+	}
+}
+
+/* --- percpu_down_write (void return; read side not traceable, see top) --- */
+
+kprobe:percpu_down_write
+{
+	pend_acquire(@pend, 4);
+}
+
+kretprobe:percpu_down_write
+{
+	commit_acquire(@pend, @held, @lock_depth);
+}
+
+/*
+ * =====================================================================
+ * OFF-CPU STATE TRACKING (sched_switch + sched_wakeup)
+ *
+ * A held lock's holder can lose the CPU as RUNNABLE (still queued: preempt /
+ * yield, or just woken and awaiting a CPU) or SLEEPING (off the queue,
+ * blocked).  On band entry we record per-task timing and the holder's kstack
+ * (preempt point / block site) and taint held locks (@tainted 1 = runnable,
+ * 2 = sleeping, 4 = throttled; shared map to stay loadable).
+ * On exit -- a switch-in ends RUNNABLE, a sched_wakeup ends SLEEPING -- the
+ * elapsed time is added to each tainted lock and the largest episode kept in
+ * @runnable_max / @sleep_max = (time, kstack).
+ * =====================================================================
+ */
+
+/*
+ * sched_wakeup: the seam between bands -- ends a SLEEPING episode and begins a
+ * RUNNABLE one (woken task now queued).  tid is the WAKER; use args->pid.
+ */
+tracepoint:sched:sched_wakeup
+{
+	$woken_tid = (uint32)args->pid;
+	let $wd;
+	if (find(@lock_depth, $woken_tid, $wd) && $wd > 0) {
+		/*
+		 * Sleep exit: close the SLEEPING episode (entry time + block-site
+		 * kstack from @sleep_info) into each held sleeping-tainted lock.
+		 */
+		let $si_rec;
+		if (find(@sleep_info, $woken_tid, $si_rec)) {
+			$elapsed = (int64)nsecs - $si_rec.time;
+			$sdepth = $wd;
+			$si = (int64)0;
+			unroll(8) {
+				if ($si < $sdepth) {
+					$slk = @held[$woken_tid, $si].lock;
+					if (@tainted[$woken_tid, $slk] & 2) {
+						@sleep_accum[$woken_tid, $slk] += $elapsed;
+						if ($elapsed > @sleep_max[$woken_tid, $slk].time) {
+							@sleep_max[$woken_tid, $slk] = (time = $elapsed, kstack = $si_rec.kstack);
+						}
+					}
+				}
+				$si++;
+			}
+			_ = delete(@sleep_info, $woken_tid);
+		}
+
+		/* Runnable entry: now queued, waiting for a CPU. */
+		if (!@runnable_start[$woken_tid]) {
+			@runnable_start[$woken_tid] = nsecs;
+			taint_held_locks(@held, @lock_depth, @tainted, $woken_tid, 1);
+		}
+	}
+}
+
+tracepoint:sched:sched_switch
+{
+	/* Incoming task leaves RUNNABLE; use args->next_pid (tid is outgoing). */
+	$next_tid = (uint32)args->next_pid;
+	let $rs;
+	if (find(@runnable_start, $next_tid, $rs)) {
+		$elapsed = (int64)nsecs - (int64)$rs;
+		let $nd;
+		if (find(@lock_depth, $next_tid, $nd)) {
+			$depth = $nd;
+			$i = (int64)0;
+			unroll(8) {
+				if ($i < $depth) {
+					$lk = @held[$next_tid, $i].lock;
+					if (@tainted[$next_tid, $lk] & 1) {
+						@runnable_accum[$next_tid, $lk] += $elapsed;
+						if ($elapsed > @runnable_max[$next_tid, $lk].time) {
+							@runnable_max[$next_tid, $lk] = (time = $elapsed, kstack = @runnable_kstack[$next_tid]);
+						}
+					}
+				}
+				$i++;
+			}
+		}
+		_ = delete(@runnable_start, $next_tid);
+		_ = delete(@runnable_kstack, $next_tid);
+	}
+
+	/*
+	 * Outgoing task lost the CPU while holding locks.  prev_state 0/256 =
+	 * RUNNABLE (voluntary / involuntary preempt); &1 (S) / &2 (D) = SLEEPING.
+	 * The captured kstack is the holder's own: preempt point for RUNNABLE,
+	 * block site for SLEEPING.
+	 */
+	$ps = args->prev_state;
+	$is_runnable = ($ps == 0 || $ps == 256);
+	$is_sleeping = (($ps & 0x3) != 0);
+	let $od;
+	if (($is_runnable || $is_sleeping) && find(@lock_depth, tid, $od) &&
+	    $od > 0) {
+		if ($is_runnable && !@runnable_start[tid]) {
+			@runnable_start[tid] = nsecs;
+			@runnable_kstack[tid] = kstack;
+			taint_held_locks(@held, @lock_depth, @tainted, tid, 1);
+			/*
+			 * Throttle tag (@tainted & 4): holder left CPU while its CFS
+			 * hierarchy is throttled (cfs_rq->throttle_count > 0);
+			 * deferred_throttle() suppresses this on defer-throttle
+			 * kernels.  curtask == prev (outgoing) here.
+			 */
+			if (!deferred_throttle() && curtask->se.cfs_rq != 0 &&
+			    curtask->se.cfs_rq->throttle_count > 0) {
+				taint_held_locks(@held, @lock_depth, @tainted,
+						 tid, 4);
+			}
+		}
+		if ($is_sleeping && !has_key(@sleep_info, tid)) {
+			/* Entry time + block site (what it waits for) per task. */
+			@sleep_info[tid] = (time = (int64)nsecs, kstack = kstack);
+			taint_held_locks(@held, @lock_depth, @tainted, tid, 2);
+		}
+	}
+}
+
+/*
+ * =====================================================================
+ * LOCK RELEASE
+ *
+ * Each unlock handler delegates to release_lock(); waiter detection and the
+ * lock-type string come from the stored type in report_offcpu_lock(), so the
+ * unlock probes pass no per-lock struct details.
+ * =====================================================================
+ */
+
+kprobe:mutex_unlock
+{
+	release_lock(@held, @lock_depth, @tainted, @runnable_accum,
+		@runnable_start, @runnable_kstack, @runnable_max,
+		@sleep_accum, @sleep_max, @sleep_info);
+}
+
+kprobe:up_read
+{
+	release_lock(@held, @lock_depth, @tainted, @runnable_accum,
+		@runnable_start, @runnable_kstack, @runnable_max,
+		@sleep_accum, @sleep_max, @sleep_info);
+}
+
+kprobe:up_write
+{
+	release_lock(@held, @lock_depth, @tainted, @runnable_accum,
+		@runnable_start, @runnable_kstack, @runnable_max,
+		@sleep_accum, @sleep_max, @sleep_info);
+}
+
+kprobe:percpu_up_write
+{
+	release_lock(@held, @lock_depth, @tainted, @runnable_accum,
+		@runnable_start, @runnable_kstack, @runnable_max,
+		@sleep_accum, @sleep_max, @sleep_info);
+}
+
+/*
+ * =====================================================================
+ * CLEANUP ON THREAD EXIT
+ *
+ * Drop residual map entries left by a task exiting mid-flight or by missed
+ * (inlined) lock/unlock probes.
+ * =====================================================================
+ */
+
+tracepoint:sched:sched_process_exit
+{
+	$depth = @lock_depth[tid];
+	$i = (int64)0;
+	unroll(8) {
+		if ($i < $depth) {
+			$lock = @held[tid, $i].lock;
+			_ = delete(@tainted, (tid, $lock));
+			_ = delete(@runnable_accum, (tid, $lock));
+			_ = delete(@runnable_max, (tid, $lock));
+			_ = delete(@sleep_accum, (tid, $lock));
+			_ = delete(@sleep_max, (tid, $lock));
+			_ = delete(@held, (tid, $i));
+		}
+		$i++;
+	}
+	_ = delete(@lock_depth, tid);
+	_ = delete(@pend, tid);
+	_ = delete(@runnable_start, tid);
+	_ = delete(@runnable_kstack, tid);
+	_ = delete(@sleep_info, tid);
+}
+
+END
+{
+	/*
+	 * In-flight holders: locks still held at exit that spent time off-CPU.
+	 * Off-CPU time is still growing (and the holder may be off-CPU now), so
+	 * emit with inflight=true using the acquire-site identity/stack in @held
+	 * (a remote stack can't be sampled here).  Untainted entries are skipped.
+	 */
+	for ($kv : @held) {
+		$rtid = $kv.0.0;
+		$e = $kv.1;
+		report_offcpu_lock(@runnable_accum, @runnable_start, @runnable_kstack,
+			@runnable_max, @sleep_accum, @sleep_max, @sleep_info, @tainted,
+			$rtid, $e.lock, $e.type, $e.time,
+			$e.pid, $e.comm, $e.process_name, $e.nr_cpus_allowed,
+			$e.kstack, true);
+	}
+
+	clear(@pend);
+	clear(@held);
+	clear(@lock_depth);
+	clear(@tainted);
+	clear(@runnable_accum);
+	clear(@runnable_start);
+	clear(@runnable_kstack);
+	clear(@runnable_max);
+	clear(@sleep_accum);
+	clear(@sleep_max);
+	clear(@sleep_info);
+}
