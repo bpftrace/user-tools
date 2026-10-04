@@ -1,0 +1,76 @@
+#!/usr/bin/env bpftrace
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/*
+ * proccputime.bt   Per-process CPU time of processes that exit while tracing.
+ *                  Catches short-lived processes that interval-based tools
+ *                  such as pidstat and top miss.
+ *
+ * USAGE: ./proccputime.bt
+ *
+ * Run the workload, then hit Ctrl-C. One line is printed for every process
+ * that exited during tracing, with its CPU time split into user and system.
+ * Requires kernel BTF (CONFIG_DEBUG_INFO_BTF).
+ *
+ * How it works:
+ * - Each thread's final CPU time is read at its last context switch
+ *   (sched_switch with prev_state == TASK_DEAD). After that switch the thread
+ *   never runs again, so the value is final. At sched_process_exit it is not:
+ *   the exit path itself still consumes CPU.
+ * - Threads are summed per process (tgid). A process is printed only once its
+ *   last thread has exited (sched_process_exit with group_dead).
+ * - The total is se.sum_exec_runtime; it is split into user/system in the
+ *   ratio of the tick-sampled utime:stime, as cputime_adjust() does in the
+ *   kernel. So the split is as accurate as /proc and time(1), no more.
+ * - Kernel threads (PF_KTHREAD) are skipped.
+ *
+ * Copyright 2026 Yusuke Hiramatsu
+ */
+
+BEGIN
+{
+  printf("Tracing Process CPU-time... Hit Ctrl-C to end.\n");
+}
+
+rawtracepoint:vmlinux:sched_switch
+// 0x80 = TASK_DEAD (the thread's last switch), 0x00200000 = PF_KTHREAD
+/args.prev_state == 0x80 && !(args.prev->flags & 0x00200000)/
+{
+  @name[args.prev->tgid] = args.prev->group_leader->comm;
+  @utime[args.prev->tgid] = sum(args.prev->utime);
+  @stime[args.prev->tgid] = sum(args.prev->stime);
+  @rtime[args.prev->tgid] = sum(args.prev->se.sum_exec_runtime);
+}
+
+tracepoint:sched:sched_process_exit
+// group_dead: this is the last thread of the process
+/!(curtask->flags & 0x00200000) && args.group_dead/
+{
+  @pid[curtask->tgid] = pid;
+}
+
+END
+{
+  printf("\n%-8s %-16s %10s %10s %10s\n", "PID", "COMM", "UTIME(ms)", "STIME(ms)", "RTIME(us)");
+  for ($kv : @pid){
+    $p = $kv.0;
+    $stime = (uint64)0;
+    $utime = 0;
+    $rtime_u = (uint64)@rtime[$p] / 1000;
+    if (@utime[$p] + @stime[$p] > 0){
+      $utime_m = (uint64)@utime[$p] / 1000000;
+      $stime_m = (uint64)@stime[$p] / 1000000;
+      $stime = $rtime_u * $stime_m / ($stime_m + $utime_m);
+    }
+    $utime = @rtime[$p] - (int64)$stime * 1000;
+    printf("%-8d %-16s %10d %10d %10d\n", @pid[$p], @name[$p], (uint64)$utime/1000000,
+    $stime/1000, $rtime_u);
+  }
+  clear(@name);
+  clear(@utime);
+  clear(@stime);
+  clear(@rtime);
+  clear(@pid);
+}
+
