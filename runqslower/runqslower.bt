@@ -1,0 +1,82 @@
+#!/usr/bin/env bpftrace
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/*
+ * runqslower.bt   Trace run queue latency higher than a threshold.
+ *                 Prints one line per wait, with the task that was on the
+ *                 CPU just before.
+ *
+ * This is a bpftrace version of the bcc libbpf-tools/runqslower of the same
+ * name.
+ *
+ * USAGE: ./runqslower.bt [min_us]
+ *
+ *   min_us   Print only waits of at least this many microseconds.
+ *            Default: 10000 (10 ms).
+ *
+ * How it works:
+ * - A thread starts waiting in the run queue when it is woken up
+ *   (sched_wakeup), when it is newly created (sched_wakeup_new), or when it
+ *   leaves the CPU while still runnable (sched_switch with prev_state
+ *   TASK_RUNNING, or TASK_REPORT_MAX for a preempted task).
+ * - The wait ends when the thread is switched in (sched_switch, next_pid).
+ * - The idle task (TID 0) is not a waiting thread and is skipped.
+ *
+ * Copyright 2026 Yusuke Hiramatsu
+ */
+
+#define TASK_RUNNING     0
+#define TASK_REPORT_MAX  0x100	// prev_state reported for a preempted task
+
+BEGIN
+{
+	$min_us = 10000;
+	if ($# > 0) {
+		$min_us = $1;
+	}
+	printf("Tracing run queue latency higher than %d us\n", $min_us);
+	printf("%-8s %-16s %-8s %10s %-16s %-8s\n", "TIME", "COMM", "TID",
+	       "LAT(us)", "PREV COMM", "PREV TID");
+}
+
+tracepoint:sched:sched_wakeup
+{
+	@qtime[args.pid] = nsecs;
+}
+
+tracepoint:sched:sched_wakeup_new
+{
+	@qtime[args.pid] = nsecs;
+}
+
+tracepoint:sched:sched_switch
+{
+	if (args.prev_state == TASK_RUNNING ||
+	    args.prev_state == TASK_REPORT_MAX) {
+		@qtime[args.prev_pid] = nsecs;
+	}
+	if (args.next_pid == 0) {
+		return;
+	}
+
+	$min_us = 10000;
+	if ($# > 0) {
+		$min_us = $1;
+	}
+	$ns = @qtime[args.next_pid];
+	if ($ns) {
+		$us = (uint64)((int64)nsecs - (int64)$ns) / 1000;
+		$ignore = delete(@qtime, args.next_pid);
+		if ($us >= $min_us) {
+			printf("%-8s %-16s %-8d %10d %-16s %-8d\n",
+			       strftime("%H:%M:%S", nsecs), args.next_comm,
+			       args.next_pid, $us, args.prev_comm, args.prev_pid);
+		}
+	}
+}
+
+END
+{
+	clear(@qtime);
+}
