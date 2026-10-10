@@ -6,6 +6,7 @@ process of migrating tools from the
 comprehensive list is available 
 [here](https://github.com/bpftrace/bpftrace/blob/master/README.md#tools).
 
+- [cpudist](cpudist) - On-CPU or off-CPU time per run as a histogram.
 - [hrtimersnoop](hrtimersnoop) - High-resolution timer latency tracing.
 - [mqsnoop](mqsnoop) - Trace POSIX message queue send.
 - [nfcttrace](nfcttrace) - Show entries about TCP&UDP in nf_conntrack.
