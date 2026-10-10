@@ -1,0 +1,90 @@
+#!/usr/bin/env bpftrace
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/*
+ * cpudist.bt   Summarize on-CPU time per task as a histogram.
+ *              Optionally off-CPU time, or one histogram per thread.
+ *
+ * This is a bpftrace version of the bcc tool of the same name.
+ *
+ * USAGE: ./cpudist.bt [-- [--offcpu] [--per_thread]]
+ *
+ *   --offcpu       Measure off-CPU time (from leaving the CPU until
+ *                  getting back on) instead of on-CPU time.
+ *   --per_thread   Print one histogram per thread (COMM, TID) instead of
+ *                  one for the whole system.
+ *
+ * How it works:
+ * - On-CPU time starts when a thread is switched in (sched_switch, next)
+ *   and ends when it is switched out (sched_switch, prev).
+ *   Off-CPU time is the same with start and end swapped.
+ * - Every switch-out is counted, whether the thread was preempted or went
+ *   to sleep by itself. This matches bcc tools/cpudist.py (since bcc
+ *   #3456); bcc libbpf-tools/cpudist (v0.35.0) counts only preempted
+ *   threads for on-CPU time.
+ * - The idle task (TID 0) is skipped.
+ *
+ * Copyright 2026 Yusuke Hiramatsu
+ */
+
+macro offcpu()
+{
+	getopt("offcpu", false, "Measure off-CPU time instead of on-CPU time")
+}
+
+macro per_thread()
+{
+	getopt("per_thread", false, "Print one histogram per thread")
+}
+
+BEGIN
+{
+	if (offcpu()) {
+    if (per_thread()){
+		printf("Tracing off-CPU time per thread... Hit Ctrl-C to end.\n");
+    } else {
+		  printf("Tracing off-CPU time... Hit Ctrl-C to end.\n");
+    }
+	} else {
+    if (per_thread()){
+  		printf("Tracing on-CPU time per thread... Hit Ctrl-C to end.\n");
+    } else {
+		  printf("Tracing on-CPU time... Hit Ctrl-C to end.\n");
+    }
+	}
+}
+
+tracepoint:sched:sched_switch
+{
+	// On-CPU: the interval starts at next and ends at prev.
+	// Off-CPU: swapped.
+	$start_tid = args.next_pid;
+	$end_tid = args.prev_pid;
+	$end_comm = args.prev_comm;
+	if (offcpu()) {
+		$start_tid = args.prev_pid;
+		$end_tid = args.next_pid;
+		$end_comm = args.next_comm;
+	}
+
+	$ns = @start[$end_tid];
+	if ($ns) {
+		$us = (uint64)((int64)nsecs - (int64)$ns) / 1000;
+		if (per_thread()) {
+			@usecs_by_thread[$end_comm, $end_tid] = hist($us);
+		} else {
+			@usecs = hist($us);
+		}
+		$ignore = delete(@start, $end_tid);
+	}
+
+	if ($start_tid != 0) {
+		@start[$start_tid] = nsecs;
+	}
+}
+
+END
+{
+	clear(@start);
+}
