@@ -1,0 +1,70 @@
+#!/usr/bin/env bpftrace
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/*
+ * offcputime.bt  Summarize off-CPU time by kernel and user stack.
+ *                Shows where threads were blocked, and for how long.
+ *
+ * This is a bpftrace version of the bcc tool of the same name.
+ *
+ * USAGE: ./offcputime.bt [-- [--pid=PID]]
+ *
+ *   --pid=PID   Trace this process only. Use the PID as shown by ps
+ *               (in the same PID namespace as bpftrace).
+ *
+ * How it works:
+ * - When a thread leaves the CPU (sched_switch, prev), record the time
+ *   and its kernel and user stacks.
+ * - When it gets back on the CPU (sched_switch, next), add the elapsed
+ *   time in microseconds to (comm, kernel stack, user stack).
+ * - The idle task (TID 0) is skipped.
+ *
+ * Note: when bpftrace runs inside a non-initial PID namespace (e.g. a
+ * container or WSL2), it prints "get_ns_current_pid_tgid" warnings for
+ * threads outside that namespace. The results are still correct; add
+ * --no-warnings to hide them: bpftrace --no-warnings offcputime.bt
+ *
+ * Copyright 2026 Yusuke Hiramatsu
+ */
+
+macro target_pid()
+{
+	getopt("pid", 0, "Trace this process only (PID as shown by ps)")
+}
+
+BEGIN
+{
+	if (target_pid() != 0) {
+		printf("Tracing off-CPU time of PID %d... Hit Ctrl-C to end.\n", target_pid());
+	} else {
+		printf("Tracing off-CPU time... Hit Ctrl-C to end.\n");
+	}
+}
+
+tracepoint:sched:sched_switch
+{
+	// Leaving the CPU: remember when, and where it was blocked.
+	if (args.prev_pid != 0 && (target_pid() == 0 || pid == target_pid())) {
+		@start[args.prev_pid] = nsecs;
+		@kstack[args.prev_pid] = kstack;
+		@ustack[args.prev_pid] = ustack;
+	}
+
+	// Back on the CPU: add the time spent off it.
+	$ns = @start[args.next_pid];
+	if ($ns) {
+		$us = (uint64)((int64)nsecs - (int64)$ns) / 1000;
+		@us[args.next_comm, @kstack[args.next_pid], @ustack[args.next_pid]] = sum($us);
+		$ignore = delete(@start, args.next_pid);
+		$ignore = delete(@kstack, args.next_pid);
+		$ignore = delete(@ustack, args.next_pid);
+	}
+}
+
+END
+{
+	clear(@start);
+	clear(@kstack);
+	clear(@ustack);
+}
