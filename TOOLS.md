@@ -11,6 +11,7 @@ comprehensive list is available
 - [mqsnoop](mqsnoop) - Trace POSIX message queue send.
 - [nfcttrace](nfcttrace) - Show entries about TCP&UDP in nf_conntrack.
 - [numasched](numasched) - Trace scheduling of system processes between NUMA nodes.
+- [offcputime](offcputime) - Off-CPU time by kernel and user stack.
 - [pagefaultlatency](pagefaultlatency) - Page fault latency tracing.
 - [proccputime](proccputime) - CPU time of every process that exits, including short-lived ones.
 - [reclaimlockmonitor](reclaimlockmonitor) - Monitor sleeping locks held during memory reclaim.
